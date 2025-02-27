@@ -1,4 +1,8 @@
-gym>=0.21.0
+gymnasium>=0.28.1
 numpy>=1.21.0
 matplotlib>=3.4.0
 networkx>=2.6.0
+pygame>=2.1.0
+box2d-py>=2.3.5
+pyglet>=1.5.0
+Box2D~=2.3.10
