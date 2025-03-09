@@ -2,7 +2,9 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
-from Box2D import b2World, b2PolygonShape, b2CircleShape, b2FixtureDef
+from Box2D import b2World, b2PolygonShape
+from casualty import Casualty
+from rubble import Rubble
 
 
 class DisasterResponseEnv(gym.Env):
@@ -11,12 +13,18 @@ class DisasterResponseEnv(gym.Env):
         'render_fps': 30
     }
 
-    def __init__(self, render_mode=None, world_size=(100, 100), num_casualties=5, num_rubble=10):
-        super(DisasterResponseEnv, self).__init__()
+    def __init__(self, render_mode=None, world_size=(100, 100),
+                 num_casualties=5, num_rubble=8):
+        """
+        Initialize the disaster response environment
 
+        Args:
+            render_mode: 'human' for interactive visualization, 'rgb_array' for array output
+            world_size: Size of the world in pixels
+            num_casualties: Number of casualties to place in the environment
+            num_rubble: Number of rubble obstacles to place in the environment
+        """
         self.world_size = world_size
-        self.num_casualties = num_casualties
-        self.num_rubble = num_rubble
         self.render_mode = render_mode
 
         # Physics parameters
@@ -24,26 +32,30 @@ class DisasterResponseEnv(gym.Env):
         # Create world with no gravity (top-down view)
         self.world = b2World(gravity=(0, 0), doSleep=True)
 
-        # Action space: [steering, acceleration, request_clearance, rescue_attempt]
+        # Entity counts
+        self.casualties = []
+        self.num_casualties = num_casualties
+        self.rubble = []
+        self.num_rubble = num_rubble
+
+        # Distance parameters
+        self.rescue_proximity = 2.0  # How close agent needs to be to rescue
+        self.clearing_proximity = 2.0  # How close agent needs to be to clear rubble
+
+        # Action space: [steering, acceleration, rescue_attempt, clear_rubble_attempt]
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0, 0.0, 0.0]),
             high=np.array([1.0, 1.0, 1.0, 1.0]),
             dtype=np.float32
         )
 
-        # Observation space: agent state (position, velocity, orientation)
-        # plus information about casualties and rubble
-        # [agent_x, agent_y, agent_vx, agent_vy, agent_theta,
-        #  casualties_x1, casualties_y1, ... casualties_xN, casualties_yN,
-        #  rubble_x1, rubble_y1, ... rubble_xM, rubble_yM]
-        obs_dim = 5 + 2 * num_casualties + 2 * num_rubble
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
-        )
+        # Observation space will be set in reset() after we know the
+        # number of casualties and rubble pieces
 
         # Initialize rendering
         self.screen = None
         self.clock = None
+        self.font = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -74,40 +86,40 @@ class DisasterResponseEnv(gym.Env):
         # Create boundaries
         self.create_boundaries()
 
+        # Create rubble obstacles first (before casualties)
+        self.rubble = []
+        for _ in range(self.num_rubble):
+            # Random clearing time between 5-20 steps
+            clearing_time = self.np_random.integers(5, 21)
+            rubble = Rubble(clearing_time=clearing_time)
+            rubble.create_in_world(self.world, self.scale, self.np_random, self.world_size)
+            self.rubble.append(rubble)
+
         # Create casualties
         self.casualties = []
         for _ in range(self.num_casualties):
-            position = self.find_free_position()
-            # Static body for casualties
-            casualty = self.world.CreateStaticBody(
-                position=position,
-                userData={"type": "casualty", "rescued": False, "health": 100.0}
-            )
-            casualty.CreateFixture(
-                shape=b2CircleShape(radius=0.5),
-                isSensor=True  # Makes it not collide physically
-            )
+            # Random severity between 1-3
+            severity = self.np_random.integers(1, 4)
+            casualty = Casualty(severity=severity)
+            casualty.create_in_world(self.world, self.scale, self.np_random, self.world_size)
             self.casualties.append(casualty)
 
-        # Create rubble
-        self.rubble = []
-        for _ in range(self.num_rubble):
-            position = self.find_free_position()
-            size = self.np_random.uniform(1.0, 3.0)
-            # Static body for rubble
-            rubble = self.world.CreateStaticBody(
-                position=position,
-                userData={"type": "rubble", "cleared": False, "size": size}
-            )
-            rubble.CreateFixture(
-                shape=b2PolygonShape(box=(size, size)),
-                friction=0.5
-            )
-            self.rubble.append(rubble)
+        # Update observation space to accommodate casualties and rubble
+        casualty_features = 6  # Each casualty has 6 features
+        rubble_features = 6  # Each rubble has 6 features
+        agent_features = 5  # Agent has 5 features
 
-        # Initialize step count and rescue count
+        total_features = agent_features + \
+                         (casualty_features * len(self.casualties)) + \
+                         (rubble_features * len(self.rubble))
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(total_features,), dtype=np.float32
+        )
+
+        # Initialize step count and currently clearing rubble reference
         self.steps = 0
-        self.rescued_casualties = 0
+        self.currently_clearing_rubble = None
 
         # Get initial observation
         observation = self._get_observation()
@@ -119,8 +131,8 @@ class DisasterResponseEnv(gym.Env):
         # Unpack action
         steering = float(action[0])  # Range: [-1, 1]
         acceleration = float(action[1])  # Range: [-1, 1]
-        request_clearance = float(action[2]) > 0.5  # Boolean
-        rescue_attempt = float(action[3]) > 0.5  # Boolean
+        rescue_attempt = float(action[2]) > 0.5  # Boolean conversion
+        clear_rubble_attempt = float(action[3]) > 0.5  # Boolean conversion
 
         # Apply steering and acceleration to agent
         self.agent.angle += steering * 0.1
@@ -131,72 +143,101 @@ class DisasterResponseEnv(gym.Env):
         # Simulate physics
         self.world.Step(1.0 / 30.0, 10, 10)
 
-        # Handle rubble clearance
-        reward = -0.1  # Small negative reward per step
-        if request_clearance:
-            # Find closest rubble
-            closest_rubble = None
-            closest_dist = float('inf')
-            for rubble in self.rubble:
-                if not rubble.userData["cleared"]:
-                    dist = np.sqrt(
-                        (rubble.position[0] - self.agent.position[0]) ** 2 +
-                        (rubble.position[1] - self.agent.position[1]) ** 2
-                    )
-                    if dist < 3.0 and dist < closest_dist:  # Within 3 meters
-                        closest_rubble = rubble
-                        closest_dist = dist
+        # Small negative reward per step to encourage efficiency
+        step_reward = -0.1
 
-            if closest_rubble:
-                closest_rubble.userData["cleared"] = True
-                reward += 1.0  # Reward for clearing rubble
-            else:
-                reward -= 0.5  # Penalty for requesting clearance with no nearby rubble
-
-        # Handle rescue attempts
-        if rescue_attempt:
-            # Find closest casualty
-            closest_casualty = None
-            closest_dist = float('inf')
-            for casualty in self.casualties:
-                if not casualty.userData["rescued"]:
-                    dist = np.sqrt(
-                        (casualty.position[0] - self.agent.position[0]) ** 2 +
-                        (casualty.position[1] - self.agent.position[1]) ** 2
-                    )
-                    if dist < 1.0 and dist < closest_dist:  # Within 1 meter
-                        closest_casualty = casualty
-                        closest_dist = dist
-
-            if closest_casualty:
-                closest_casualty.userData["rescued"] = True
-                self.rescued_casualties += 1
-                reward += 10.0  # Big reward for rescuing casualty
-            else:
-                reward -= 0.5  # Penalty for attempting rescue with no nearby casualties
-
-        # Update casualty health (optional: casualties' health deteriorates over time)
+        # Update casualty rewards/health based on time
         for casualty in self.casualties:
-            if not casualty.userData["rescued"]:
-                casualty.userData["health"] -= 0.1  # Health decreases over time
+            casualty.update_reward()
+
+        # Handle rubble clearing
+        rubble_reward = 0.0
+        agent_position = (self.agent.position[0], self.agent.position[1])
+
+        # Stop clearing rubble if the agent moves away or tries to clear a different piece
+        if self.currently_clearing_rubble:
+            distance_to_current = np.sqrt(
+                (agent_position[0] - self.currently_clearing_rubble.body.position[0]) ** 2 +
+                (agent_position[1] - self.currently_clearing_rubble.body.position[1]) ** 2
+            )
+            if distance_to_current > self.clearing_proximity or not clear_rubble_attempt:
+                self.currently_clearing_rubble.stop_clearing()
+                self.currently_clearing_rubble = None
+
+        # Process clearing attempt
+        if clear_rubble_attempt:
+            # Check if already clearing a rubble
+            if not self.currently_clearing_rubble:
+                # Find the closest uncleared rubble within range
+                closest_rubble = None
+                closest_distance = float('inf')
+
+                for rubble in self.rubble:
+                    if not rubble.cleared and not rubble.being_cleared:
+                        distance = np.sqrt(
+                            (agent_position[0] - rubble.body.position[0]) ** 2 +
+                            (agent_position[1] - rubble.body.position[1]) ** 2
+                        )
+                        if distance <= self.clearing_proximity and distance < closest_distance:
+                            closest_rubble = rubble
+                            closest_distance = distance
+
+                # Start clearing the closest rubble if found
+                if closest_rubble:
+                    closest_rubble.start_clearing()
+                    self.currently_clearing_rubble = closest_rubble
+
+        # Update all rubble that is being cleared
+        for rubble in self.rubble:
+            if rubble.being_cleared:
+                was_cleared = rubble.update_clearing()
+                if was_cleared:
+                    # Award a small reward for clearing rubble
+                    rubble_reward += 5.0
+                    # If this was the rubble we were clearing, reset reference
+                    if rubble == self.currently_clearing_rubble:
+                        self.currently_clearing_rubble = None
+
+        # Handle rescue attempt if action indicates
+        rescue_reward = 0.0
+        if rescue_attempt:
+            for casualty in self.casualties:
+                # Only try to rescue if alive and not already rescued
+                if casualty.is_alive and not casualty.rescued:
+                    # Check if the casualty's position is blocked by any uncleared rubble
+                    casualty_blocked = False
+                    for rubble in self.rubble:
+                        if not rubble.cleared and rubble.is_position_blocked(
+                                (casualty.body.position[0], casualty.body.position[1])
+                        ):
+                            casualty_blocked = True
+                            break
+
+                    # Only allow rescue if casualty isn't blocked by rubble
+                    if not casualty_blocked:
+                        rescue_success = casualty.attempt_rescue(
+                            agent_position, self.rescue_proximity
+                        )
+                        if rescue_success:
+                            # Award the current reward value if rescue successful
+                            rescue_reward += casualty.current_reward
+
+        # Calculate total reward
+        reward = step_reward + rescue_reward + rubble_reward
 
         # Check termination conditions
         self.steps += 1
-        terminated = self.rescued_casualties == self.num_casualties
 
-        # Check if agent is stuck or out of bounds
-        agent_pos = self.agent.position
-        if (agent_pos[0] < 0 or agent_pos[0] > self.world_size[0] / self.scale or
-                agent_pos[1] < 0 or agent_pos[1] > self.world_size[1] / self.scale):
-            terminated = True
-            reward -= 10.0  # Penalty for going out of bounds
+        # Episode is terminated if all casualties are either rescued or dead
+        all_handled = all(
+            casualty.rescued or not casualty.is_alive
+            for casualty in self.casualties
+        )
+
+        terminated = all_handled
 
         # Time limit
         truncated = self.steps >= 1000  # Arbitrary time limit
-
-        # Add bonus for completion
-        if terminated and self.rescued_casualties == self.num_casualties:
-            reward += 50.0
 
         # Get observation and info
         observation = self._get_observation()
@@ -218,35 +259,34 @@ class DisasterResponseEnv(gym.Env):
             self.agent.angle
         ]
 
-        # Casualty positions
-        casualty_positions = []
+        # Collect casualty states
+        casualty_states = []
         for casualty in self.casualties:
-            if not casualty.userData["rescued"]:
-                casualty_positions.extend([
-                    casualty.position[0],
-                    casualty.position[1]
-                ])
-            else:
-                casualty_positions.extend([0, 0])  # Zeroed if rescued
+            casualty_states.extend(casualty.get_observation())
 
-        # Rubble positions
-        rubble_positions = []
+        # Collect rubble states
+        rubble_states = []
         for rubble in self.rubble:
-            if not rubble.userData["cleared"]:
-                rubble_positions.extend([
-                    rubble.position[0],
-                    rubble.position[1]
-                ])
-            else:
-                rubble_positions.extend([0, 0])  # Zeroed if cleared
+            rubble_states.extend(rubble.get_observation())
 
-        return np.array(agent_state + casualty_positions + rubble_positions, dtype=np.float32)
+        # Combine agent, casualty, and rubble observations
+        return np.array(agent_state + casualty_states + rubble_states, dtype=np.float32)
 
     def _get_info(self):
+        rescued_count = sum(1 for c in self.casualties if c.rescued)
+        alive_count = sum(1 for c in self.casualties if c.is_alive and not c.rescued)
+        dead_count = sum(1 for c in self.casualties if not c.is_alive)
+        cleared_rubble = sum(1 for r in self.rubble if r.cleared)
+        being_cleared = 1 if self.currently_clearing_rubble else 0
+
         return {
             'steps': self.steps,
-            'casualties_remaining': self.num_casualties - self.rescued_casualties,
-            'rescued_casualties': self.rescued_casualties
+            'casualties_rescued': rescued_count,
+            'casualties_alive': alive_count,
+            'casualties_dead': dead_count,
+            'rubble_cleared': cleared_rubble,
+            'total_rubble': len(self.rubble),
+            'currently_clearing': being_cleared
         }
 
     def render(self):
@@ -267,49 +307,24 @@ class DisasterResponseEnv(gym.Env):
 
         # Process events to keep the window responsive
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.close()
-                return
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    return
+                elif event.key == pygame.K_r:
+                    self.reset()
+                    return
 
         # Fill background
         self.screen.fill((255, 255, 255))
 
-        # Draw rubble
+        # Draw rubble first
         for rubble in self.rubble:
-            if not rubble.userData["cleared"]:
-                position = (int(rubble.position[0] * self.scale), int(rubble.position[1] * self.scale))
-                size = int(rubble.userData["size"] * self.scale)
-                pygame.draw.rect(
-                    self.screen,
-                    (100, 100, 100),  # Dark grey
-                    pygame.Rect(position[0] - size, position[1] - size, 2 * size, 2 * size)
-                )
-            else:
-                position = (int(rubble.position[0] * self.scale), int(rubble.position[1] * self.scale))
-                size = int(rubble.userData["size"] * self.scale)
-                pygame.draw.rect(
-                    self.screen,
-                    (200, 200, 200),  # Light grey
-                    pygame.Rect(position[0] - size, position[1] - size, 2 * size, 2 * size)
-                )
+            rubble.render(self.screen, self.scale)
 
         # Draw casualties
         for casualty in self.casualties:
-            position = (int(casualty.position[0] * self.scale), int(casualty.position[1] * self.scale))
-            if not casualty.userData["rescued"]:
-                pygame.draw.circle(
-                    self.screen,
-                    (255, 0, 0),  # Red
-                    position,
-                    int(0.5 * self.scale)
-                )
-            else:
-                pygame.draw.circle(
-                    self.screen,
-                    (0, 255, 0),  # Green
-                    position,
-                    int(0.5 * self.scale)
-                )
+            casualty.render(self.screen, self.scale)
 
         # Draw agent
         agent_position = (int(self.agent.position[0] * self.scale), int(self.agent.position[1] * self.scale))
@@ -319,20 +334,22 @@ class DisasterResponseEnv(gym.Env):
         points = [
             (agent_position[0] + int(1.0 * self.scale * np.cos(agent_angle)),
              agent_position[1] + int(1.0 * self.scale * np.sin(agent_angle))),
-            (agent_position[0] + int(0.5 * self.scale * np.cos(agent_angle + 2.5)),
-             agent_position[1] + int(0.5 * self.scale * np.sin(agent_angle + 2.5))),
-            (agent_position[0] + int(0.5 * self.scale * np.cos(agent_angle - 2.5)),
-             agent_position[1] + int(0.5 * self.scale * np.sin(agent_angle - 2.5)))
+            (agent_position[0] + int(0.5 * self.scale * np.cos(agent_angle + 1.5)),
+             agent_position[1] + int(0.5 * self.scale * np.sin(agent_angle + 1.5))),
+            (agent_position[0] + int(0.5 * self.scale * np.cos(agent_angle - 1.5)),
+             agent_position[1] + int(0.5 * self.scale * np.sin(agent_angle - 1.5)))
         ]
         pygame.draw.polygon(self.screen, (0, 0, 255), points)  # Blue
 
         # Status text
-        status_text = f"Steps: {self.steps}, Casualties: {self.rescued_casualties}/{self.num_casualties}"
+        info = self._get_info()
+        status_text = (f"Steps: {self.steps} | Rescued: {info['casualties_rescued']} | "
+                       f"Alive: {info['casualties_alive']} | Dead: {info['casualties_dead']} | ")
         text_surface = self.font.render(status_text, True, (0, 0, 0))
         self.screen.blit(text_surface, (10, 10))
 
         # Draw instructions
-        instructions = "ESC: Exit | R: Reset"
+        instructions = "Esc: Exit"
         instr_surface = self.font.render(instructions, True, (0, 0, 0))
         self.screen.blit(instr_surface, (10, self.world_size[1] - 40))
 
@@ -393,50 +410,3 @@ class DisasterResponseEnv(gym.Env):
         right_wall.CreateFixture(
             shape=b2PolygonShape(box=(wall_thickness, self.world_size[1] / (2 * self.scale)))
         )
-
-    def find_free_position(self):
-        """Find a position that doesn't overlap with existing objects"""
-        while True:
-            position = (
-                self.np_random.uniform(5, self.world_size[0] - 5) / self.scale,
-                self.np_random.uniform(5, self.world_size[1] - 5) / self.scale
-            )
-
-            # Check distance from agent (if agent exists)
-            if hasattr(self, 'agent'):
-                agent_dist = np.sqrt(
-                    (position[0] - self.agent.position[0]) ** 2 +
-                    (position[1] - self.agent.position[1]) ** 2
-                )
-                if agent_dist < 3.0:
-                    continue
-
-            # Check distance from casualties (if any exist)
-            if hasattr(self, 'casualties') and self.casualties:
-                too_close = False
-                for casualty in self.casualties:
-                    dist = np.sqrt(
-                        (position[0] - casualty.position[0]) ** 2 +
-                        (position[1] - casualty.position[1]) ** 2
-                    )
-                    if dist < 2.0:
-                        too_close = True
-                        break
-                if too_close:
-                    continue
-
-            # Check distance from rubble (if any exist)
-            if hasattr(self, 'rubble') and self.rubble:
-                too_close = False
-                for rubble in self.rubble:
-                    dist = np.sqrt(
-                        (position[0] - rubble.position[0]) ** 2 +
-                        (position[1] - rubble.position[1]) ** 2
-                    )
-                    if dist < 3.0:
-                        too_close = True
-                        break
-                if too_close:
-                    continue
-
-            return position
