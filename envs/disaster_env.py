@@ -5,6 +5,7 @@ import pygame
 from Box2D import b2World, b2PolygonShape
 from casualty import Casualty
 from rubble import Rubble
+from entity_manager import EntityManager
 
 
 class DisasterResponseEnv(gym.Env):
@@ -32,10 +33,11 @@ class DisasterResponseEnv(gym.Env):
         # Create world with no gravity (top-down view)
         self.world = b2World(gravity=(0, 0), doSleep=True)
 
+        # Initialize entity manager
+        self.entity_manager = EntityManager()
+
         # Entity counts
-        self.casualties = []
         self.num_casualties = num_casualties
-        self.rubble = []
         self.num_rubble = num_rubble
 
         # Distance parameters
@@ -64,6 +66,9 @@ class DisasterResponseEnv(gym.Env):
         for body in self.world.bodies:
             self.world.DestroyBody(body)
 
+        # Clear the entity manager
+        self.entity_manager.clear()
+
         # Create agent (rescue vehicle) - Dynamic body
         self.agent = self.world.CreateDynamicBody(
             position=(self.np_random.uniform(10, self.world_size[0] - 10) / self.scale,
@@ -87,22 +92,20 @@ class DisasterResponseEnv(gym.Env):
         self.create_boundaries()
 
         # Create rubble obstacles first (before casualties)
-        self.rubble = []
         for _ in range(self.num_rubble):
             # Random clearing time between 5-20 steps
             clearing_time = self.np_random.integers(5, 21)
             rubble = Rubble(clearing_time=clearing_time)
             rubble.create_in_world(self.world, self.scale, self.np_random, self.world_size)
-            self.rubble.append(rubble)
+            self.entity_manager.add_rubble(rubble)
 
         # Create casualties
-        self.casualties = []
         for _ in range(self.num_casualties):
             # Random severity between 1-3
             severity = self.np_random.integers(1, 4)
             casualty = Casualty(severity=severity)
             casualty.create_in_world(self.world, self.scale, self.np_random, self.world_size)
-            self.casualties.append(casualty)
+            self.entity_manager.add_casualty(casualty)
 
         # Update observation space to accommodate casualties and rubble
         casualty_features = 6  # Each casualty has 6 features
@@ -110,8 +113,8 @@ class DisasterResponseEnv(gym.Env):
         agent_features = 5  # Agent has 5 features
 
         total_features = agent_features + \
-                         (casualty_features * len(self.casualties)) + \
-                         (rubble_features * len(self.rubble))
+                         (casualty_features * len(self.entity_manager.get_casualties())) + \
+                         (rubble_features * len(self.entity_manager.get_rubble()))
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(total_features,), dtype=np.float32
@@ -147,7 +150,7 @@ class DisasterResponseEnv(gym.Env):
         step_reward = -0.1
 
         # Update casualty rewards/health based on time
-        for casualty in self.casualties:
+        for casualty in self.entity_manager.get_casualties():
             casualty.update_reward()
 
         # Handle rubble clearing
@@ -155,40 +158,32 @@ class DisasterResponseEnv(gym.Env):
         agent_position = (self.agent.position[0], self.agent.position[1])
 
         # Stop clearing rubble if the agent moves away or tries to clear a different piece
-        if self.currently_clearing_rubble:
+        currently_clearing_rubble = self.entity_manager.get_currently_clearing_rubble()
+        if currently_clearing_rubble:
             distance_to_current = np.sqrt(
-                (agent_position[0] - self.currently_clearing_rubble.body.position[0]) ** 2 +
-                (agent_position[1] - self.currently_clearing_rubble.body.position[1]) ** 2
+                (agent_position[0] - currently_clearing_rubble.body.position[0]) ** 2 +
+                (agent_position[1] - currently_clearing_rubble.body.position[1]) ** 2
             )
             if distance_to_current > self.clearing_proximity or not clear_rubble_attempt:
-                self.currently_clearing_rubble.stop_clearing()
+                currently_clearing_rubble.stop_clearing()
                 self.currently_clearing_rubble = None
 
         # Process clearing attempt
         if clear_rubble_attempt:
             # Check if already clearing a rubble
-            if not self.currently_clearing_rubble:
+            if not currently_clearing_rubble:
                 # Find the closest uncleared rubble within range
-                closest_rubble = None
-                closest_distance = float('inf')
+                closest_rubble, closest_distance = self.entity_manager.find_nearest_rubble(
+                    agent_position, only_uncleared=True
+                )
 
-                for rubble in self.rubble:
-                    if not rubble.cleared and not rubble.being_cleared:
-                        distance = np.sqrt(
-                            (agent_position[0] - rubble.body.position[0]) ** 2 +
-                            (agent_position[1] - rubble.body.position[1]) ** 2
-                        )
-                        if distance <= self.clearing_proximity and distance < closest_distance:
-                            closest_rubble = rubble
-                            closest_distance = distance
-
-                # Start clearing the closest rubble if found
-                if closest_rubble:
+                # Start clearing the closest rubble if found and within proximity
+                if closest_rubble and closest_distance <= self.clearing_proximity:
                     closest_rubble.start_clearing()
                     self.currently_clearing_rubble = closest_rubble
 
         # Update all rubble that is being cleared
-        for rubble in self.rubble:
+        for rubble in self.entity_manager.get_rubble():
             if rubble.being_cleared:
                 was_cleared = rubble.update_clearing()
                 if was_cleared:
@@ -201,26 +196,21 @@ class DisasterResponseEnv(gym.Env):
         # Handle rescue attempt if action indicates
         rescue_reward = 0.0
         if rescue_attempt:
-            for casualty in self.casualties:
-                # Only try to rescue if alive and not already rescued
-                if casualty.is_alive and not casualty.rescued:
-                    # Check if the casualty's position is blocked by any uncleared rubble
-                    casualty_blocked = False
-                    for rubble in self.rubble:
-                        if not rubble.cleared and rubble.is_position_blocked(
-                                (casualty.body.position[0], casualty.body.position[1])
-                        ):
-                            casualty_blocked = True
-                            break
+            # Get unblocked casualties near the agent
+            nearby_casualties = self.entity_manager.get_casualties_in_radius(
+                agent_position, self.rescue_proximity,
+                only_alive=True, only_unrescued=True
+            )
 
-                    # Only allow rescue if casualty isn't blocked by rubble
-                    if not casualty_blocked:
-                        rescue_success = casualty.attempt_rescue(
-                            agent_position, self.rescue_proximity
-                        )
-                        if rescue_success:
-                            # Award the current reward value if rescue successful
-                            rescue_reward += casualty.current_reward
+            for casualty in nearby_casualties:
+                # Only attempt rescue if casualty isn't blocked by rubble
+                if not self.entity_manager.is_casualty_blocked_by_rubble(casualty):
+                    rescue_success = casualty.attempt_rescue(
+                        agent_position, self.rescue_proximity
+                    )
+                    if rescue_success:
+                        # Award the current reward value if rescue successful
+                        rescue_reward += casualty.current_reward
 
         # Calculate total reward
         reward = step_reward + rescue_reward + rubble_reward
@@ -229,11 +219,7 @@ class DisasterResponseEnv(gym.Env):
         self.steps += 1
 
         # Episode is terminated if all casualties are either rescued or dead
-        all_handled = all(
-            casualty.rescued or not casualty.is_alive
-            for casualty in self.casualties
-        )
-
+        all_handled = (self.entity_manager.count_alive_casualties() == 0)
         terminated = all_handled
 
         # Time limit
@@ -259,34 +245,24 @@ class DisasterResponseEnv(gym.Env):
             self.agent.angle
         ]
 
-        # Collect casualty states
-        casualty_states = []
-        for casualty in self.casualties:
-            casualty_states.extend(casualty.get_observation())
-
-        # Collect rubble states
-        rubble_states = []
-        for rubble in self.rubble:
-            rubble_states.extend(rubble.get_observation())
+        # Get casualty and rubble observations from entity manager
+        casualty_obs, rubble_obs = self.entity_manager.get_entity_observations()
 
         # Combine agent, casualty, and rubble observations
-        return np.array(agent_state + casualty_states + rubble_states, dtype=np.float32)
+        return np.array(agent_state + casualty_obs + rubble_obs, dtype=np.float32)
 
     def _get_info(self):
-        rescued_count = sum(1 for c in self.casualties if c.rescued)
-        alive_count = sum(1 for c in self.casualties if c.is_alive and not c.rescued)
-        dead_count = sum(1 for c in self.casualties if not c.is_alive)
-        cleared_rubble = sum(1 for r in self.rubble if r.cleared)
-        being_cleared = 1 if self.currently_clearing_rubble else 0
+        # Get entity statistics from the entity manager
+        entity_stats = self.entity_manager.get_entity_stats()
 
         return {
             'steps': self.steps,
-            'casualties_rescued': rescued_count,
-            'casualties_alive': alive_count,
-            'casualties_dead': dead_count,
-            'rubble_cleared': cleared_rubble,
-            'total_rubble': len(self.rubble),
-            'currently_clearing': being_cleared
+            'casualties_rescued': entity_stats['casualties_rescued'],
+            'casualties_alive': entity_stats['casualties_alive'],
+            'casualties_dead': entity_stats['casualties_dead'],
+            'rubble_cleared': entity_stats['rubble_cleared'],
+            'total_rubble': entity_stats['rubble_total'],
+            'currently_clearing': entity_stats['currently_clearing']
         }
 
     def render(self):
@@ -311,19 +287,16 @@ class DisasterResponseEnv(gym.Env):
                 if event.key == pygame.K_ESCAPE:
                     pygame.quit()
                     return
-                elif event.key == pygame.K_r:
-                    self.reset()
-                    return
 
         # Fill background
         self.screen.fill((255, 255, 255))
 
         # Draw rubble first
-        for rubble in self.rubble:
+        for rubble in self.entity_manager.get_rubble():
             rubble.render(self.screen, self.scale)
 
         # Draw casualties
-        for casualty in self.casualties:
+        for casualty in self.entity_manager.get_casualties():
             casualty.render(self.screen, self.scale)
 
         # Draw agent
@@ -351,7 +324,7 @@ class DisasterResponseEnv(gym.Env):
         # Draw instructions
         instructions = "Esc: Exit"
         instr_surface = self.font.render(instructions, True, (0, 0, 0))
-        self.screen.blit(instr_surface, (10, self.world_size[1] - 40))
+        self.screen.blit(instr_surface, (10, self.world_size[1] - 30))
 
         # Update display
         pygame.display.flip()
